@@ -15,6 +15,7 @@
 #include "base/array.hpp"
 #include "base/exception.hpp"
 #include "base/utility.hpp"
+#include "base/object-packer.hpp"
 #include "icinga/command.hpp"
 #include "icinga/compatutility.hpp"
 #include "icinga/customvarobject.hpp"
@@ -121,6 +122,40 @@ void IcingaDB::ConfigStaticInitialize()
 
 	Service::OnHostProblemChanged.connect([](const Service::Ptr& service, const CheckResult::Ptr&, const MessageOrigin::Ptr&) {
 		IcingaDB::StateChangeHandler(service);
+	});
+
+	Notification::OnUsersRawChangedWithOldValue.connect([](const Notification::Ptr& notification, const Value& oldValues, const Value& newValues) {
+		IcingaDB::NotificationUsersChangedHandler(notification, oldValues, newValues);
+	});
+	Notification::OnUserGroupsRawChangedWithOldValue.connect([](const Notification::Ptr& notification, const Value& oldValues, const Value& newValues) {
+		IcingaDB::NotificationUserGroupsChangedHandler(notification, oldValues, newValues);
+	});
+	TimePeriod::OnRangesChangedWithOldValue.connect([](const TimePeriod::Ptr& timeperiod, const Value& oldValues, const Value& newValues) {
+		IcingaDB::TimePeriodRangesChangedHandler(timeperiod, oldValues, newValues);
+	});
+	TimePeriod::OnIncludesChangedWithOldValue.connect([](const TimePeriod::Ptr& timeperiod, const Value& oldValues, const Value& newValues) {
+		IcingaDB::TimePeriodIncludesChangedHandler(timeperiod, oldValues, newValues);
+	});
+	TimePeriod::OnExcludesChangedWithOldValue.connect([](const TimePeriod::Ptr& timeperiod, const Value& oldValues, const Value& newValues) {
+		IcingaDB::TimePeriodExcludesChangedHandler(timeperiod, oldValues, newValues);
+	});
+	User::OnGroupsChangedWithOldValue.connect([](const User::Ptr& user, const Value& oldValues, const Value& newValues) {
+		IcingaDB::UserGroupsChangedHandler(user, oldValues, newValues);
+	});
+	Host::OnGroupsChangedWithOldValue.connect([](const Host::Ptr& host, const Value& oldValues, const Value& newValues) {
+		IcingaDB::HostGroupsChangedHandler(host, oldValues, newValues);
+	});
+	Service::OnGroupsChangedWithOldValue.connect([](const Service::Ptr& service, const Value& oldValues, const Value& newValues) {
+		IcingaDB::ServiceGroupsChangedHandler(service, oldValues, newValues);
+	});
+	Command::OnEnvChangedWithOldValue.connect([](const ConfigObject::Ptr& command, const Value& oldValues, const Value& newValues) {
+		IcingaDB::CommandEnvChangedHandler(command, oldValues, newValues);
+	});
+	Command::OnArgumentsChangedWithOldValue.connect([](const ConfigObject::Ptr& command, const Value& oldValues, const Value& newValues) {
+		IcingaDB::CommandArgumentsChangedHandler(command, oldValues, newValues);
+	});
+	CustomVarObject::OnVarsChangedWithOldValue.connect([](const ConfigObject::Ptr& object, const Value& oldValues, const Value& newValues) {
+		IcingaDB::CustomVarsChangedHandler(object, oldValues, newValues);
 	});
 }
 
@@ -850,12 +885,7 @@ void IcingaDB::InsertObjectDependencies(const ConfigObject::Ptr& object, const S
 
 	if (type == User::TypeInstance) {
 		User::Ptr user = static_pointer_cast<User>(object);
-
-		Array::Ptr groups;
-		ConfigObject::Ptr (*getGroup)(const String& name);
-
-		groups = user->GetGroups();
-		getGroup = &::GetObjectByName<UserGroup>;
+		Array::Ptr groups = user->GetGroups();
 
 		if (groups) {
 			ObjectLock groupsLock(groups);
@@ -864,9 +894,10 @@ void IcingaDB::InsertObjectDependencies(const ConfigObject::Ptr& object, const S
 			groupIds->Reserve(groups->GetLength());
 
 			auto& members (hMSets[m_PrefixConfigObject + typeName + "group:member"]);
+			auto& notificationRecipients (hMSets[m_PrefixConfigObject + "notification:recipient"]);
 
 			for (auto& group : groups) {
-				auto groupObj ((*getGroup)(group));
+				UserGroup::Ptr groupObj = UserGroup::GetByName(group);
 				String groupId = GetObjectIdentifier(groupObj);
 				String id = HashValue(new Array(Prepend(env, Prepend(GetObjectIdentifiersWithoutEnv(groupObj), GetObjectIdentifiersWithoutEnv(object)))));
 				members.emplace_back(id);
@@ -875,6 +906,20 @@ void IcingaDB::InsertObjectDependencies(const ConfigObject::Ptr& object, const S
 
 				if (runtimeUpdate) {
 					AddObjectDataToRuntimeUpdates(runtimeUpdates, id, m_PrefixConfigObject + typeName + "group:member", data);
+				}
+
+				// Recipients are handled by notifications during initial dumps and only need to be handled here during runtime (e.g. User creation).
+				if (runtimeUpdate) {
+					for (auto& notification : groupObj->GetNotifications()) {
+						String recipientId = HashValue(new Array(Prepend(env, Prepend("user", Prepend(GetObjectIdentifiersWithoutEnv(user), GetObjectIdentifiersWithoutEnv(notification))))));
+						notificationRecipients.emplace_back(recipientId);
+						Dictionary::Ptr recipientData = new Dictionary({{"notification_id", GetObjectIdentifier(notification)}, {"environment_id", m_EnvironmentId}, {"user_id", objectKey}});
+						notificationRecipients.emplace_back(JsonEncode(recipientData));
+
+						if (runtimeUpdate) {
+							AddObjectDataToRuntimeUpdates(runtimeUpdates, id, m_PrefixConfigObject + "notification:recipient", recipientData);
+						}
+					}
 				}
 
 				groupIds->Add(groupId);
@@ -903,7 +948,7 @@ void IcingaDB::InsertObjectDependencies(const ConfigObject::Ptr& object, const S
 
 		for (auto& user : users) {
 			String userId = GetObjectIdentifier(user);
-			String id = HashValue(new Array(Prepend(env, Prepend(GetObjectIdentifiersWithoutEnv(user), GetObjectIdentifiersWithoutEnv(object)))));
+			String id = HashValue(new Array(Prepend(env, Prepend("user", Prepend(GetObjectIdentifiersWithoutEnv(user), GetObjectIdentifiersWithoutEnv(object))))));
 			usrs.emplace_back(id);
 			Dictionary::Ptr data = new Dictionary({{"notification_id", objectKey}, {"environment_id", m_EnvironmentId}, {"user_id", userId}});
 			usrs.emplace_back(JsonEncode(data));
@@ -1475,7 +1520,8 @@ IcingaDB::CreateConfigUpdate(const ConfigObject::Ptr& object, const String typeN
 
 void IcingaDB::SendConfigDelete(const ConfigObject::Ptr& object)
 {
-	String typeName = object->GetReflectionType()->GetName().ToLower();
+	Type::Ptr type = object->GetReflectionType();
+	String typeName = type->GetName().ToLower();
 	String objectKey = GetObjectIdentifier(object);
 
 	m_Rcon->FireAndForgetQueries({
@@ -1487,12 +1533,24 @@ void IcingaDB::SendConfigDelete(const ConfigObject::Ptr& object)
 		}
    	}, Prio::Config);
 
-	auto checkable (dynamic_pointer_cast<Checkable>(object));
+	auto env (GetEnvironment());
+	CustomVarObject::Ptr customVarObject = dynamic_pointer_cast<CustomVarObject>(object);
 
-	if (checkable) {
+	if (customVarObject) {
+		Dictionary::Ptr vars = customVarObject->GetVars();
+		SendCustomVarsChanged(customVarObject, vars, nullptr);
+	}
+
+	if (type == Host::TypeInstance || type == Service::TypeInstance) {
+		Checkable::Ptr checkable = static_pointer_cast<Checkable>(object);
+
+		Host::Ptr host;
+		Service::Ptr service;
+		tie(host, service) = GetHostService(checkable);
+
 		m_Rcon->FireAndForgetQuery({
 			"ZREM",
-			dynamic_pointer_cast<Service>(checkable) ? "icinga:nextupdate:service" : "icinga:nextupdate:host",
+			service ? "icinga:nextupdate:service" : "icinga:nextupdate:host",
 			GetObjectIdentifier(checkable)
 		}, Prio::CheckResult);
 
@@ -1500,6 +1558,46 @@ void IcingaDB::SendConfigDelete(const ConfigObject::Ptr& object)
 			{"HDEL", m_PrefixConfigObject + typeName + ":state", objectKey},
 			{"HDEL", m_PrefixConfigCheckSum + typeName + ":state", objectKey}
 		}, Prio::RuntimeStateSync);
+
+		ConfigObject::Ptr (*getGroup)(const String& name);
+		Array::Ptr groups;
+		if (service) {
+			groups = service->GetGroups();
+		} else {
+			groups = host->GetGroups();
+		}
+
+		SendGroupsChanged(checkable, groups, nullptr);
+
+		return;
+	}
+
+	if (type == TimePeriod::TypeInstance) {
+		TimePeriod::Ptr timeperiod = static_pointer_cast<TimePeriod>(object);
+		SendTimePeriodRangesChanged(timeperiod, timeperiod->GetRanges(), nullptr);
+		SendTimePeriodIncludesChanged(timeperiod, timeperiod->GetIncludes(), nullptr);
+		SendTimePeriodExcludesChanged(timeperiod, timeperiod->GetExcludes(), nullptr);
+		return;
+	}
+
+	if (type == User::TypeInstance) {
+		User::Ptr user = static_pointer_cast<User>(object);
+		SendGroupsChanged(user, user->GetGroups(), nullptr);
+		return;
+	}
+
+	if (type == Notification::TypeInstance) {
+		Notification::Ptr notification = static_pointer_cast<Notification>(object);
+		SendNotificationUsersChanged(notification, notification->GetUsersRaw(), nullptr);
+		SendNotificationUserGroupsChanged(notification, notification->GetUserGroupsRaw(), nullptr);
+		return;
+	}
+
+	if (type == CheckCommand::TypeInstance || type == NotificationCommand::TypeInstance || type == EventCommand::TypeInstance) {
+		Command::Ptr command = static_pointer_cast<Command>(object);
+		SendCommandArgumentsChanged(command, command->GetArguments(), nullptr);
+		SendCommandEnvChanged(command, command->GetEnv(), nullptr);
+		return;
 	}
 }
 
@@ -2177,6 +2275,159 @@ void IcingaDB::SendAcknowledgementCleared(const Checkable::Ptr& checkable, const
 	m_Rcon->FireAndForgetQuery(std::move(xAdd), Prio::History);
 }
 
+void IcingaDB::SendNotificationUsersChanged(const Notification::Ptr& notification, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<Value> deletedUsers = GetArrayDeletedValues(oldValues, newValues);
+
+	for (const auto& userName : deletedUsers) {
+		User::Ptr user = User::GetByName(userName);
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend("user", Prepend(GetObjectIdentifiersWithoutEnv(user), GetObjectIdentifiersWithoutEnv(notification))))));
+		DeleteRelationship(id, "notification:user");
+		DeleteRelationship(id, "notification:recipient");
+	}
+}
+
+void IcingaDB::SendNotificationUserGroupsChanged(const Notification::Ptr& notification, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<Value> deletedUserGroups = GetArrayDeletedValues(oldValues, newValues);
+
+	for (const auto& userGroupName : deletedUserGroups) {
+		UserGroup::Ptr userGroup = UserGroup::GetByName(userGroupName);
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend("usergroup", Prepend(GetObjectIdentifiersWithoutEnv(userGroup), GetObjectIdentifiersWithoutEnv(notification))))));
+		DeleteRelationship(id, "notification:usergroup");
+		DeleteRelationship(id, "notification:recipient");
+
+		for (const User::Ptr& user : userGroup->GetMembers()) {;
+			String userId = HashValue(new Array(Prepend(GetEnvironment(), Prepend("user", Prepend(GetObjectIdentifiersWithoutEnv(user), GetObjectIdentifiersWithoutEnv(notification))))));
+			DeleteRelationship(userId, "notification:recipient");
+		}
+	}
+}
+
+void IcingaDB::SendTimePeriodRangesChanged(const TimePeriod::Ptr& timeperiod, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<String> deletedKeys = GetDictionaryDeletedKeys(oldValues, newValues);
+	String typeName = GetLowerCaseTypeNameDB(timeperiod);
+
+	for (const auto& rangeKey : deletedKeys) {
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(rangeKey, Prepend(oldValues->Get(rangeKey), GetObjectIdentifiersWithoutEnv(timeperiod))))));
+		DeleteRelationship(id, "timeperiod:range");
+	}
+}
+
+void IcingaDB::SendTimePeriodIncludesChanged(const TimePeriod::Ptr& timeperiod, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<Value> deletedIncludes = GetArrayDeletedValues(oldValues, newValues);
+
+	for (const auto& includeName : deletedIncludes) {
+		TimePeriod::Ptr includeTp = TimePeriod::GetByName(includeName);
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(GetObjectIdentifiersWithoutEnv(includeTp), GetObjectIdentifiersWithoutEnv(timeperiod)))));
+		DeleteRelationship(id, "timeperiod:override:include");
+	}
+}
+
+void IcingaDB::SendTimePeriodExcludesChanged(const TimePeriod::Ptr& timeperiod, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<Value> deletedExcludes = GetArrayDeletedValues(oldValues, newValues);
+
+	for (const auto& excludeName : deletedExcludes) {
+		TimePeriod::Ptr excludeTp = TimePeriod::GetByName(excludeName);
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(GetObjectIdentifiersWithoutEnv(excludeTp), GetObjectIdentifiersWithoutEnv(timeperiod)))));
+		DeleteRelationship(id, "timeperiod:override:exclude");
+	}
+}
+
+void IcingaDB::SendGroupsChanged(const ConfigObject::Ptr& object, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<Value> deletedGroups = GetArrayDeletedValues(oldValues, newValues);
+	String typeName = GetLowerCaseTypeNameDB(object);
+	ConfigObject::Ptr (*getGroup)(const String& name);
+
+	if (typeName == "user") {
+		getGroup = &::GetObjectByName<UserGroup>;
+	} else if (typeName == "host") {
+		getGroup = &::GetObjectByName<HostGroup>;
+	} else {
+		getGroup = &::GetObjectByName<ServiceGroup>;
+	}
+
+	for (const auto& groupName : deletedGroups) {
+		auto group ((*getGroup)(groupName));
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(GetObjectIdentifiersWithoutEnv(group), GetObjectIdentifiersWithoutEnv(object)))));
+		DeleteRelationship(id, typeName + "group:member");
+
+		if (typeName == "user") {
+			UserGroup::Ptr userGroup = dynamic_pointer_cast<UserGroup>(group);
+
+			for (const auto& notification : userGroup->GetNotifications()) {
+				String userId = HashValue(new Array(Prepend(GetEnvironment(), Prepend("user", Prepend(GetObjectIdentifiersWithoutEnv(object), GetObjectIdentifiersWithoutEnv(notification))))));
+				DeleteRelationship(userId, "notification:recipient");
+			}
+		}
+	}
+}
+
+void IcingaDB::SendCommandEnvChanged(const ConfigObject::Ptr& command, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<String> deletedKeys = GetDictionaryDeletedKeys(oldValues, newValues);
+	String typeName = GetLowerCaseTypeNameDB(command);
+
+	for (const auto& envvarKey : deletedKeys) {
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(envvarKey, GetObjectIdentifiersWithoutEnv(command)))));
+		DeleteRelationship(id, typeName + ":envvar", true);
+	}
+}
+
+void IcingaDB::SendCommandArgumentsChanged(const ConfigObject::Ptr& command, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<String> deletedKeys = GetDictionaryDeletedKeys(oldValues, newValues);
+	String typeName = GetLowerCaseTypeNameDB(command);
+
+	for (const auto& argumentKey : deletedKeys) {
+		String id = HashValue(new Array(Prepend(GetEnvironment(), Prepend(argumentKey, GetObjectIdentifiersWithoutEnv(command)))));
+		DeleteRelationship(id, typeName + ":argument", true);
+	}
+}
+
+void IcingaDB::SendCustomVarsChanged(const ConfigObject::Ptr& object, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	if (!m_Rcon || !m_Rcon->IsConnected() || oldValues == newValues) {
+		return;
+	}
+
+	std::vector<String> deletedKeys = GetDictionaryDeletedKeys(oldValues, newValues);
+	String typeName = GetLowerCaseTypeNameDB(object);
+	String env = GetEnvironment();
+
+	for (const auto& customVarKey : deletedKeys) {
+		String id = HashValue(new Array(Prepend(env, Prepend(SHA1(PackObject((Array::Ptr)new Array({env, customVarKey, oldValues->Get(customVarKey)}))), GetObjectIdentifiersWithoutEnv(object)))));
+		DeleteRelationship(id, typeName + ":customvar");
+	}
+}
+
 Dictionary::Ptr IcingaDB::SerializeState(const Checkable::Ptr& checkable)
 {
 	Dictionary::Ptr attrs = new Dictionary();
@@ -2472,4 +2723,90 @@ void IcingaDB::AcknowledgementClearedHandler(const Checkable::Ptr& checkable, co
 			rw->SendAcknowledgementCleared(checkable, *rb, changeTime, ackLastChange);
 		}
 	}
+}
+
+void IcingaDB::NotificationUsersChangedHandler(const Notification::Ptr& notification, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendNotificationUsersChanged(notification, oldValues, newValues);
+	}
+}
+
+void IcingaDB::NotificationUserGroupsChangedHandler(const Notification::Ptr& notification, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendNotificationUserGroupsChanged(notification, oldValues, newValues);
+	}
+}
+
+void IcingaDB::TimePeriodRangesChangedHandler(const TimePeriod::Ptr& timeperiod, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendTimePeriodRangesChanged(timeperiod, oldValues, newValues);
+	}
+}
+
+void IcingaDB::TimePeriodIncludesChangedHandler(const TimePeriod::Ptr& timeperiod, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendTimePeriodIncludesChanged(timeperiod, oldValues, newValues);
+	}
+}
+
+void IcingaDB::TimePeriodExcludesChangedHandler(const TimePeriod::Ptr& timeperiod, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendTimePeriodExcludesChanged(timeperiod, oldValues, newValues);
+	}
+}
+
+void IcingaDB::UserGroupsChangedHandler(const User::Ptr& user, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendGroupsChanged(user, oldValues, newValues);
+	}
+}
+
+void IcingaDB::HostGroupsChangedHandler(const Host::Ptr& host, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendGroupsChanged(host, oldValues, newValues);
+	}
+}
+
+void IcingaDB::ServiceGroupsChangedHandler(const Service::Ptr& service, const Array::Ptr& oldValues, const Array::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendGroupsChanged(service, oldValues, newValues);
+	}
+}
+
+void IcingaDB::CommandEnvChangedHandler(const ConfigObject::Ptr& command, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendCommandEnvChanged(command, oldValues, newValues);
+	}
+}
+
+void IcingaDB::CommandArgumentsChangedHandler(const ConfigObject::Ptr& command, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendCommandArgumentsChanged(command, oldValues, newValues);
+	}
+}
+
+void IcingaDB::CustomVarsChangedHandler(const ConfigObject::Ptr& object, const Dictionary::Ptr& oldValues, const Dictionary::Ptr& newValues) {
+	for (const IcingaDB::Ptr& rw : ConfigType::GetObjectsByType<IcingaDB>()) {
+		rw->SendCustomVarsChanged(object, oldValues, newValues);
+	}
+}
+
+void IcingaDB::DeleteRelationship(const String& id, const String& redisKeyWithoutPrefix, bool hasChecksum) {
+	Log(LogCritical, "DEBUG") << "Deleting: " << redisKeyWithoutPrefix << " -> " << id;
+
+	String redisKey = m_PrefixConfigObject + redisKeyWithoutPrefix;
+
+	std::vector<std::vector<String>> queries = {
+		{"HDEL", redisKey, id},
+		{
+			"XADD", "icinga:runtime", "MAXLEN", "~", "1000000", "*",
+			"redis_key", redisKey, "id", id, "runtime_type", "delete"
+		}
+	};
+
+	if (hasChecksum) {
+		queries.push_back({"HDEL", m_PrefixConfigCheckSum + redisKeyWithoutPrefix});
+	}
+
+	m_Rcon->FireAndForgetQueries(queries, Prio::Config);
 }

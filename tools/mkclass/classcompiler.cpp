@@ -830,10 +830,9 @@ void ClassCompiler::HandleClass(const Klass& klass, const ClassDebugInfo&)
 				m_Impl << "void ObjectImpl<" << klass.Name << ">::Set" << field.GetFriendlyName() << "(" << field.Type.GetArgumentType() << " value, bool suppress_events, const Value& cookie)" << std::endl
 					<< "{" << std::endl;
 
-				if (field.Type.IsName || !field.TrackAccessor.empty())
+				if (field.Type.IsName || !field.TrackAccessor.empty() || field.Attributes & FASignalWithOldValue)
 					m_Impl << "\t" << "Value oldValue = Get" << field.GetFriendlyName() << "();" << std::endl;
 
-					
 				if (field.SetAccessor.empty() && !(field.Attributes & FANoStorage))
 					m_Impl << "\t" << "m_" << field.GetFriendlyName() << ".store(value);" << std::endl;
 				else
@@ -849,8 +848,14 @@ void ClassCompiler::HandleClass(const Klass& klass, const ClassDebugInfo&)
 					m_Impl << "\t" << "Track" << field.GetFriendlyName() << "(oldValue, value);" << std::endl;
 				}
 
-				m_Impl << "\t" << "if (!suppress_events)" << std::endl
-					<< "\t\t" << "Notify" << field.GetFriendlyName() << "(cookie);" << std::endl
+				m_Impl << "\t" << "if (!suppress_events) {" << std::endl
+					<< "\t\t" << "Notify" << field.GetFriendlyName() << "(cookie);" << std::endl;
+
+				if (field.Attributes & FASignalWithOldValue) {
+					m_Impl << "\t\t" << "On" << field.GetFriendlyName() << "ChangedWithOldValue(static_cast<" << klass.Name << " *>(this), oldValue, value);" << std::endl;
+				}
+
+				m_Impl << "\t" "}" << std::endl << std::endl
 					<< "}" << std::endl << std::endl;
 			}
 		}
@@ -1053,6 +1058,15 @@ void ClassCompiler::HandleClass(const Klass& klass, const ClassDebugInfo&)
 		for (const Field& field : klass.Fields) {
 			m_Header << "\t" << "static boost::signals2::signal<void (const intrusive_ptr<" << klass.Name << ">&, const Value&)> On" << field.GetFriendlyName() << "Changed;" << std::endl;
 			m_Impl << std::endl << "boost::signals2::signal<void (const intrusive_ptr<" << klass.Name << ">&, const Value&)> ObjectImpl<" << klass.Name << ">::On" << field.GetFriendlyName() << "Changed;" << std::endl << std::endl;
+
+			if (field.Attributes & FASignalWithOldValue) {
+				m_Header << "\t" << "static boost::signals2::signal<void (const intrusive_ptr<" << klass.Name
+						 << ">&, const Value&, const Value&)> On" << field.GetFriendlyName() << "ChangedWithOldValue;"
+						 << std::endl;
+				m_Impl << std::endl << "boost::signals2::signal<void (const intrusive_ptr<" << klass.Name
+					   << ">&, const Value&, const Value&)> ObjectImpl<" << klass.Name << ">::On"
+					   << field.GetFriendlyName() << "ChangedWithOldValue;" << std::endl << std::endl;
+			}
 		}
 	}
 

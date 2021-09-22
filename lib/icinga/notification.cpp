@@ -121,6 +121,10 @@ void Notification::OnAllConfigLoaded()
 		BOOST_THROW_EXCEPTION(ScriptError("Notification object refers to a host/service which doesn't exist.", GetDebugInfo()));
 
 	GetCheckable()->RegisterNotification(this);
+
+	for (const UserGroup::Ptr& group : GetUserGroups()) {
+		group->AddNotification(this);
+	}
 }
 
 void Notification::Start(bool runtimeCreated)
@@ -132,6 +136,10 @@ void Notification::Start(bool runtimeCreated)
 
 	if (ApiListener::IsHACluster() && GetNextNotification() < Utility::GetTime() + 60)
 		SetNextNotification(Utility::GetTime() + 60, true);
+
+	for (const UserGroup::Ptr& group : GetUserGroups()) {
+		group->AddNotification(this);
+	}
 
 	ObjectImpl<Notification>::Start(runtimeCreated);
 }

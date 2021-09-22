@@ -227,3 +227,41 @@ String IcingaDB::IcingaToStreamValue(const Value& value)
 			return JsonEncode(value);
 	}
 }
+
+// Returns the items that exist in "arrayOld" but not in "arrayNew"
+std::vector<Value> IcingaDB::GetArrayDeletedValues(const Array::Ptr& arrayOld, const Array::Ptr& arrayNew) {
+	std::vector<Value> deletedValues;
+
+	if (!arrayOld) {
+		return deletedValues;
+	}
+
+	if (!arrayNew) {
+		return std::vector<Value>(arrayOld->Begin(), arrayOld->End());
+	}
+
+	std::set_difference(arrayOld->Begin(), arrayOld->End(), arrayNew->Begin(), arrayNew->End(), std::back_inserter(deletedValues));
+
+	return deletedValues;
+}
+
+// Returns the keys that exist in "dictOld" but not in "dictNew"
+std::vector<String> IcingaDB::GetDictionaryDeletedKeys(const Dictionary::Ptr& dictOld, const Dictionary::Ptr& dictNew) {
+	std::vector<String> deletedKeys;
+
+	if (!dictOld) {
+		return deletedKeys;
+	}
+
+	std::vector<String> oldKeys = dictOld->GetKeys();
+
+	if (!dictNew) {
+		return oldKeys;
+	}
+
+	std::vector<String> newKeys = dictNew->GetKeys();
+
+	std::set_difference(oldKeys.begin(), oldKeys.end(), newKeys.begin(), newKeys.end(), std::back_inserter(deletedKeys));
+
+	return deletedKeys;
+}
